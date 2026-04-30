@@ -28,6 +28,31 @@ func TestParseTraceroute_basic(t *testing.T) {
 	}
 }
 
+func TestParseTraceroute_ecmp(t *testing.T) {
+	// hop 4 has ECMP continuation lines — all RTTs should be collected into one hop
+	input := `traceroute to 8.8.8.8 (8.8.8.8), 5 hops max, 40 byte packets
+ 1  192.168.0.1 (192.168.0.1)  3.0 ms  2.0 ms  1.0 ms
+ 4  r56-186.seed.net.tw (139.175.56.186)  14.0 ms
+    r57-150.seed.net.tw (139.175.57.150)  17.0 ms
+    r56-50.seed.net.tw (139.175.56.50)  12.0 ms  10.0 ms
+`
+	hops := parseTraceroute(input)
+	if len(hops) != 2 {
+		t.Fatalf("expected 2 hops (hop 1 and hop 4), got %d", len(hops))
+	}
+	h4 := hops[1]
+	if h4.Count != 4 {
+		t.Errorf("expected hop 4, got %d", h4.Count)
+	}
+	// 4 RTT samples total across 3 continuation lines
+	if h4.Snt < 4 {
+		t.Errorf("expected at least 4 samples for ECMP hop, got Snt=%d", h4.Snt)
+	}
+	if h4.Loss != 0 {
+		t.Errorf("expected 0 loss for ECMP hop, got %.1f%%", h4.Loss)
+	}
+}
+
 func TestParseTraceroute_partialLoss(t *testing.T) {
 	// 3 probes, 1 timeout = 33.3% loss
 	input := `traceroute to 8.8.8.8 (8.8.8.8), 5 hops max, 40 byte packets

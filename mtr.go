@@ -82,7 +82,8 @@ func runMtr(target string) (string, error) {
 	return string(result), nil
 }
 
-var hopLineRegex = regexp.MustCompile(`^\s*(\d+)\s+(.+)$`)
+var newHopRegex = regexp.MustCompile(`^\s*(\d+)\s+(.+)$`)
+var contLineRegex = regexp.MustCompile(`^\s{4,}(\S.+)$`) // ECMP continuation: no leading hop number
 var rttRegex = regexp.MustCompile(`([\d.]+)\s*ms`)
 var ipRegex = regexp.MustCompile(`\(?([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})\)?`)
 
@@ -90,47 +91,46 @@ func parseTraceroute(output string) []hop {
 	lines := strings.Split(output, "\n")
 	hopMap := make(map[int]*parsedHop)
 	var hopOrder []int
+	currentHop := 0 // tracks which hop number continuation lines belong to
 
 	for _, line := range lines {
 		line = strings.TrimRight(line, "\r")
-		m := hopLineRegex.FindStringSubmatch(line)
-		if m == nil {
+
+		// Try new hop line first
+		if m := newHopRegex.FindStringSubmatch(line); m != nil {
+			hopNum, err := strconv.Atoi(m[1])
+			if err != nil {
+				continue
+			}
+			rest := m[2]
+			if strings.Contains(rest, "hops max") {
+				continue
+			}
+
+			p, exists := hopMap[hopNum]
+			if !exists {
+				p = &parsedHop{num: hopNum}
+				hopMap[hopNum] = p
+				hopOrder = append(hopOrder, hopNum)
+				if ipM := ipRegex.FindStringSubmatch(rest); ipM != nil {
+					p.host = ipM[1]
+				}
+			}
+			collectLine(p, rest)
+			currentHop = hopNum
 			continue
 		}
-		hopNum, err := strconv.Atoi(m[1])
-		if err != nil {
-			continue
-		}
-		rest := m[2]
 
-		// skip traceroute header line
-		if strings.Contains(rest, "hops max") {
-			continue
-		}
-
-		p, exists := hopMap[hopNum]
-		if !exists {
-			p = &parsedHop{num: hopNum}
-			hopMap[hopNum] = p
-			hopOrder = append(hopOrder, hopNum)
-
-			// grab the first IP from this line
-			if ipM := ipRegex.FindStringSubmatch(rest); ipM != nil {
-				p.host = ipM[1]
+		// ECMP continuation line (indented, no leading number)
+		if currentHop > 0 {
+			if m := contLineRegex.FindStringSubmatch(line); m != nil {
+				if p, ok := hopMap[currentHop]; ok {
+					collectLine(p, m[1])
+				}
 			}
 		}
-
-		// collect RTT values
-		for _, r := range rttRegex.FindAllStringSubmatch(rest, -1) {
-			v, err := strconv.ParseFloat(r[1], 64)
-			if err == nil {
-				p.rttSamples = append(p.rttSamples, v)
-			}
-		}
-
-		// count timeouts
-		p.timeouts += strings.Count(rest, "*")
 	}
+
 
 	result := make([]hop, 0, len(hopOrder))
 	for _, num := range hopOrder {
@@ -189,6 +189,17 @@ func parseTraceroute(output string) []hop {
 		})
 	}
 	return result
+}
+
+// collectLine extracts RTT samples and star-timeouts from one output segment
+func collectLine(p *parsedHop, text string) {
+	for _, r := range rttRegex.FindAllStringSubmatch(text, -1) {
+		v, err := strconv.ParseFloat(r[1], 64)
+		if err == nil {
+			p.rttSamples = append(p.rttSamples, v)
+		}
+	}
+	p.timeouts += strings.Count(text, "*")
 }
 
 func sqrtF(x float64) float64 {
