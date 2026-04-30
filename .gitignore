@@ -1,0 +1,4 @@
+/mtr-runner
+/mtr-runner-*
+*.exe
+.DS_Store
