@@ -1,27 +1,42 @@
 package main
 
 import (
-	"strings"
 	"testing"
 )
 
-func TestFindMtrBinary_NotFound(t *testing.T) {
-	_, err := findMtrBinary([]string{"/nonexistent/path"})
+func TestResolveHost_Invalid(t *testing.T) {
+	_, err := resolveHost("this.host.does.not.exist.invalid")
 	if err == nil {
-		t.Fatal("expected error when mtr not found")
+		t.Fatal("expected error for invalid host")
 	}
 }
 
-func TestBuildMtrArgs(t *testing.T) {
-	args := buildMtrArgs("google.com")
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--json") {
-		t.Error("expected --json flag")
+func TestRoundMs(t *testing.T) {
+	cases := []struct{ in, want float64 }{
+		{1.23456, 1.2},
+		{0, 0},
+		{99.99, 100.0},
 	}
-	if !strings.Contains(joined, "--report") {
-		t.Error("expected --report flag")
+	for _, c := range cases {
+		got := roundMs(c.in)
+		if got != c.want {
+			t.Errorf("roundMs(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
-	if !strings.Contains(joined, "google.com") {
-		t.Error("expected target in args")
+}
+
+func TestSqrtF(t *testing.T) {
+	cases := []struct{ in, want float64 }{
+		{0, 0},
+		{4, 2},
+		{9, 3},
+		{-1, 0},
+	}
+	for _, c := range cases {
+		got := sqrtF(c.in)
+		diff := got - c.want
+		if diff < -0.001 || diff > 0.001 {
+			t.Errorf("sqrtF(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }
