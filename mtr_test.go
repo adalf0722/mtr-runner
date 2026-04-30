@@ -4,10 +4,41 @@ import (
 	"testing"
 )
 
-func TestResolveHost_Invalid(t *testing.T) {
-	_, err := resolveHost("this.host.does.not.exist.invalid")
-	if err == nil {
-		t.Fatal("expected error for invalid host")
+func TestParseTraceroute_basic(t *testing.T) {
+	input := `traceroute to 8.8.8.8 (8.8.8.8), 5 hops max, 40 byte packets
+ 1  192.168.0.1 (192.168.0.1)  3.088 ms  1.555 ms  1.396 ms
+ 2  10.0.0.1 (10.0.0.1)  12.750 ms  11.783 ms  11.661 ms
+ 3  * * *
+`
+	hops := parseTraceroute(input)
+	if len(hops) != 3 {
+		t.Fatalf("expected 3 hops, got %d", len(hops))
+	}
+	if hops[0].Host != "192.168.0.1" {
+		t.Errorf("hop 1 host = %q, want 192.168.0.1", hops[0].Host)
+	}
+	if hops[0].Loss != 0 {
+		t.Errorf("hop 1 loss = %v, want 0", hops[0].Loss)
+	}
+	if hops[2].Host != "???" {
+		t.Errorf("hop 3 host = %q, want ???", hops[2].Host)
+	}
+	if hops[2].Loss != 100 {
+		t.Errorf("hop 3 loss = %v, want 100", hops[2].Loss)
+	}
+}
+
+func TestParseTraceroute_partialLoss(t *testing.T) {
+	// 3 probes, 1 timeout = 33.3% loss
+	input := `traceroute to 8.8.8.8 (8.8.8.8), 5 hops max, 40 byte packets
+ 1  192.168.0.1 (192.168.0.1)  3.0 ms  * 2.0 ms
+`
+	hops := parseTraceroute(input)
+	if len(hops) != 1 {
+		t.Fatalf("expected 1 hop, got %d", len(hops))
+	}
+	if hops[0].Loss == 0 || hops[0].Loss == 100 {
+		t.Errorf("expected partial loss, got %v%%", hops[0].Loss)
 	}
 }
 

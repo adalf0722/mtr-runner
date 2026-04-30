@@ -1,20 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
-const cycles = 10
+const probesPerHop = 10
 const maxHops = 30
 
 type hop struct {
@@ -31,200 +27,168 @@ type hop struct {
 type mtrReport struct {
 	Report struct {
 		Mtr struct {
-			Dst        string `json:"dst"`
-			Src        string `json:"src"`
-			Tos        int    `json:"tos"`
-			Psize      int    `json:"psize"`
-			Bitpattern int    `json:"bitpattern"`
-			Tests      int    `json:"tests"`
+			Dst   string `json:"dst"`
+			Tests int    `json:"tests"`
+			Psize int    `json:"psize"`
 		} `json:"mtr"`
 		Hubs []hop `json:"hubs"`
 	} `json:"report"`
 }
 
-func runMtr(target string) (string, error) {
-	fmt.Printf("正在解析 %s ...\n", target)
-	destIP, err := resolveHost(target)
-	if err != nil {
-		return "", fmt.Errorf("無法解析主機名稱：%w", err)
-	}
-	fmt.Printf("目標：%s (%s)\n", target, destIP)
+// parsedHop holds intermediate data during traceroute output parsing
+type parsedHop struct {
+	num        int
+	host       string
+	rttSamples []float64
+	timeouts   int
+}
 
-	hops, err := tracePath(destIP, target)
-	if err != nil {
-		return "", err
+func runMtr(target string) (string, error) {
+	fmt.Printf("正在追蹤路由到 %s ...\n", target)
+
+	var out []byte
+	var err error
+
+	if runtime.GOOS == "windows" {
+		out, err = exec.Command("tracert", "-h", strconv.Itoa(maxHops), "-w", "1000", target).Output()
+	} else {
+		out, err = exec.Command("traceroute",
+			"-m", strconv.Itoa(maxHops),
+			"-q", strconv.Itoa(probesPerHop),
+			"-w", "1",
+			target,
+		).Output()
+	}
+	if err != nil && len(out) == 0 {
+		return "", fmt.Errorf("traceroute 執行失敗：%w", err)
+	}
+
+	hops := parseTraceroute(string(out))
+	if len(hops) == 0 {
+		return "", fmt.Errorf("無法解析 traceroute 輸出")
 	}
 
 	var report mtrReport
 	report.Report.Mtr.Dst = target
-	report.Report.Mtr.Tests = cycles
-	report.Report.Mtr.Psize = 64
+	report.Report.Mtr.Tests = probesPerHop
+	report.Report.Mtr.Psize = 40
 	report.Report.Hubs = hops
 
-	out, err := json.Marshal(report)
+	result, err := json.Marshal(report)
 	if err != nil {
 		return "", err
 	}
-	return string(out), nil
+	fmt.Println("完成！")
+	return string(result), nil
 }
 
-func resolveHost(host string) (string, error) {
-	addrs, err := net.LookupHost(host)
-	if err != nil {
-		return "", err
-	}
-	return addrs[0], nil
-}
+var hopLineRegex = regexp.MustCompile(`^\s*(\d+)\s+(.+)$`)
+var rttRegex = regexp.MustCompile(`([\d.]+)\s*ms`)
+var ipRegex = regexp.MustCompile(`\(?([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})\)?`)
 
-func tracePath(destIP, target string) ([]hop, error) {
-	var hops []hop
-	consecutiveUnknown := 0
+func parseTraceroute(output string) []hop {
+	lines := strings.Split(output, "\n")
+	hopMap := make(map[int]*parsedHop)
+	var hopOrder []int
 
-	for ttl := 1; ttl <= maxHops; ttl++ {
-		fmt.Printf("  測試第 %d 跳...\r", ttl)
-		h := probeHop(ttl, target, destIP)
-		hops = append(hops, h)
-
-		if h.Host == "???" {
-			consecutiveUnknown++
-		} else {
-			consecutiveUnknown = 0
-		}
-
-		// 到達目的地
-		if h.Host == destIP {
-			break
-		}
-		// 連續 5 個 ??? 停止
-		if consecutiveUnknown >= 5 {
-			break
-		}
-	}
-	fmt.Println("  完成！                    ")
-	return hops, nil
-}
-
-func probeHop(ttl int, target, destIP string) hop {
-	rtts, hopIP := pingTTLMulti(ttl, cycles, target)
-
-	sent := cycles
-	received := 0
-	var sum, best, worst float64
-	best = 999999
-
-	for _, rtt := range rtts {
-		if rtt < 0 {
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		m := hopLineRegex.FindStringSubmatch(line)
+		if m == nil {
 			continue
 		}
-		received++
-		sum += rtt
-		if rtt < best {
-			best = rtt
+		hopNum, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
 		}
-		if rtt > worst {
-			worst = rtt
+		rest := m[2]
+
+		// skip traceroute header line
+		if strings.Contains(rest, "hops max") {
+			continue
 		}
+
+		p, exists := hopMap[hopNum]
+		if !exists {
+			p = &parsedHop{num: hopNum}
+			hopMap[hopNum] = p
+			hopOrder = append(hopOrder, hopNum)
+
+			// grab the first IP from this line
+			if ipM := ipRegex.FindStringSubmatch(rest); ipM != nil {
+				p.host = ipM[1]
+			}
+		}
+
+		// collect RTT values
+		for _, r := range rttRegex.FindAllStringSubmatch(rest, -1) {
+			v, err := strconv.ParseFloat(r[1], 64)
+			if err == nil {
+				p.rttSamples = append(p.rttSamples, v)
+			}
+		}
+
+		// count timeouts
+		p.timeouts += strings.Count(rest, "*")
 	}
 
-	loss := float64(sent-received) / float64(sent) * 100
+	result := make([]hop, 0, len(hopOrder))
+	for _, num := range hopOrder {
+		p := hopMap[num]
+		received := len(p.rttSamples)
+		total := received + p.timeouts
+		if total == 0 {
+			total = probesPerHop
+		}
 
-	if received == 0 || hopIP == "" {
-		return hop{Count: ttl, Host: "???", Loss: 100, Snt: sent}
-	}
+		host := p.host
+		if host == "" {
+			host = "???"
+		}
 
-	avg := sum / float64(received)
+		if received == 0 {
+			result = append(result, hop{Count: p.num, Host: host, Loss: 100, Snt: total})
+			continue
+		}
 
-	var variance float64
-	for _, rtt := range rtts {
-		if rtt >= 0 {
-			d := rtt - avg
+		var sum, best, worst float64
+		best = p.rttSamples[0]
+		worst = p.rttSamples[0]
+		for _, v := range p.rttSamples {
+			sum += v
+			if v < best {
+				best = v
+			}
+			if v > worst {
+				worst = v
+			}
+		}
+		avg := sum / float64(received)
+
+		var variance float64
+		for _, v := range p.rttSamples {
+			d := v - avg
 			variance += d * d
 		}
-	}
-	stddev := 0.0
-	if received > 1 {
-		stddev = sqrtF(variance / float64(received))
-	}
-
-	return hop{
-		Count: ttl,
-		Host:  hopIP,
-		Loss:  loss,
-		Snt:   sent,
-		Avg:   roundMs(avg),
-		Best:  roundMs(best),
-		Wrst:  roundMs(worst),
-		StDev: roundMs(stddev),
-	}
-}
-
-var rttRegex = regexp.MustCompile(`time[<=]([\d.]+)\s*ms`)
-var hopIPRegex = regexp.MustCompile(`(?:From|from)\s+([\d.]+)`)
-
-// pingTTLMulti 平行跑 n 次 ping，回傳所有 RTT 和這個 hop 的 IP
-func pingTTLMulti(ttl, n int, target string) ([]float64, string) {
-	type result struct {
-		rtt float64
-		ip  string
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			rtt, ip := singlePing(ttl, target)
-			results[idx] = result{rtt, ip}
-		}(i)
-		time.Sleep(10 * time.Millisecond)
-	}
-	wg.Wait()
-
-	rtts := make([]float64, n)
-	hopIP := ""
-	for i, r := range results {
-		rtts[i] = r.rtt
-		if r.ip != "" && hopIP == "" {
-			hopIP = r.ip
+		stddev := 0.0
+		if received > 1 {
+			stddev = sqrtF(variance / float64(received))
 		}
+
+		loss := float64(total-received) / float64(total) * 100
+
+		result = append(result, hop{
+			Count: p.num,
+			Host:  host,
+			Loss:  roundMs(loss),
+			Snt:   total,
+			Avg:   roundMs(avg),
+			Best:  roundMs(best),
+			Wrst:  roundMs(worst),
+			StDev: roundMs(stddev),
+		})
 	}
-	return rtts, hopIP
-}
-
-func singlePing(ttl int, target string) (float64, string) {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("ping", "-n", "1", "-i", strconv.Itoa(ttl), "-w", "1000", target)
-	} else {
-		cmd = exec.Command("ping", "-c", "1", "-m", strconv.Itoa(ttl), "-W", "1", target)
-	}
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	cmd.Run()
-
-	output := out.String()
-
-	// 取得回應 IP（TTL exceeded 的節點）
-	ip := ""
-	if m := hopIPRegex.FindStringSubmatch(output); m != nil {
-		ip = m[1]
-	} else if strings.Contains(output, target) && rttRegex.MatchString(output) {
-		// 直接到達目的地
-		ip = target
-	}
-
-	// 取得 RTT
-	rtt := -1.0
-	if m := rttRegex.FindStringSubmatch(output); m != nil {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
-			rtt = v
-		}
-	}
-
-	return rtt, ip
+	return result
 }
 
 func sqrtF(x float64) float64 {
